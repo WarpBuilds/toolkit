@@ -8,7 +8,7 @@ exports[`provenance functions buildSLSAProvenancePredicate returns a provenance 
       "externalParameters": {
         "workflow": {
           "path": ".github/workflows/main.yml",
-          "ref": "main",
+          "ref": "refs/heads/main",
           "repository": "https://foo.ghe.com/owner/repo",
         },
       },

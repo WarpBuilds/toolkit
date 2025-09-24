@@ -1,0 +1,21 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "node",
+      "request": "launch",
+      "name": "Debug Typescript",
+      "program": "${workspaceFolder}/packages/cache/src/test.ts",
+      "cwd": "${workspaceFolder}/packages/cache",
+      "preLaunchTask": "Build Cache Package",
+      "outFiles": ["${workspaceFolder}/packages/cache/lib/**/*.js"],
+      "env": {
+        "NODE_OPTIONS": "--use-openssl-ca",
+        "NODE_EXTRA_CA_CERTS": "/Users/prajjwal/runner/certs/localCA.crt"
+      }
+    }
+  ]
+}

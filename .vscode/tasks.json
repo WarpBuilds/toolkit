@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Cache Package",
+      "type": "npm",
+      "script": "tsc",
+      "path": "packages/cache",
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "problemMatcher": "$tsc",
+      "detail": "Build only the cache package"
+    }
+  ]
+}

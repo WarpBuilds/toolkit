@@ -1,6 +1,6 @@
 {
   "name": "github-actions.warp-cache",
-  "version": "1.4.6-1",
+  "version": "1.4.6-2",
   "preview": true,
   "description": "Github action to use WarpBuild's in-house cache offering",
   "keywords": [
@@ -49,10 +49,10 @@
     "@azure/storage-blob": "^12.25.0",
     "@google-cloud/storage": "^7.9.0",
     "@octokit/webhooks-definitions": "^3.67.3",
-    "axios": "^1.6.2",
+    "axios": "^1.15.2",
     "google-auth-library": "^9.7.0",
     "semver": "^6.3.1",
-    "uuid": "^3.3.3"
+    "uuid": "^14.0.0"
   },
   "devDependencies": {
     "@types/semver": "^6.0.0",

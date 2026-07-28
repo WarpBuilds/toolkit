@@ -168,7 +168,7 @@ jobs:
           rm -rf test-cache ~/test-cache
           node -e "
             require('./packages/warp-cache/lib/cache')
-              .restoreCache(['test-cache'], 'e2e-nonexistent-${{ github.run_id }}', ['e2e-${{ runner.os }}-${{ runner.arch }}-'])
+              .restoreCache(['test-cache','~/test-cache'], 'e2e-nonexistent-${{ github.run_id }}', ['e2e-${{ runner.os }}-${{ runner.arch }}-'])
               .then(k => {
                 if (!k) { console.error('restore-key fallback did not match'); process.exit(1) }
                 console.log('fell back to:', k)
@@ -180,7 +180,7 @@ jobs:
         run: |
           node -e "
             require('./packages/warp-cache/lib/cache')
-              .restoreCache(['test-cache'], 'e2e-definitely-absent-${{ github.run_id }}')
+              .restoreCache(['test-cache','~/test-cache'], 'e2e-definitely-absent-${{ github.run_id }}')
               .then(k => {
                 if (k) { console.error('expected a miss, got', k); process.exit(1) }
                 console.log('miss handled cleanly')
@@ -194,7 +194,7 @@ jobs:
           rm -rf test-cache
           node -e "
             require('./packages/warp-cache/lib/cache')
-              .restoreCache(['test-cache'], 'e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}', [], {lookupOnly: true})
+              .restoreCache(['test-cache','~/test-cache'], 'e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}', [], {lookupOnly: true})
               .then(k => {
                 if (!k) { console.error('lookupOnly should still report the hit'); process.exit(1) }
                 console.log('lookupOnly hit:', k)
@@ -247,15 +247,16 @@ jobs:
 
       - name: Round-trip a key containing "${{ matrix.name }}"
         shell: bash
+        env:
+          KEY: ${{ matrix.key }}-${{ github.run_id }}
         run: |
           mkdir -p keytest && echo "payload ${{ matrix.name }} ${{ github.run_id }}" > keytest/file.txt
-          KEY='${{ matrix.key }}-${{ github.run_id }}'
           node -e "
             const cache = require('./packages/warp-cache/lib/cache')
             cache.saveCache(['keytest'], process.env.KEY)
               .then(() => console.log('saved'))
               .catch(e => { console.error('SAVE FAILED:', e.message); process.exit(1) })
-          " KEY="$KEY"
+          "
           rm -rf keytest
           node -e "
             const cache = require('./packages/warp-cache/lib/cache')
@@ -265,7 +266,7 @@ jobs:
                 console.log('restored:', k)
               })
               .catch(e => { console.error('RESTORE FAILED:', e.message); process.exit(1) })
-          " KEY="$KEY"
+          "
           grep -q "payload ${{ matrix.name }} ${{ github.run_id }}" keytest/file.txt
 
   # -------------------------------------------------------------------------
@@ -433,6 +434,8 @@ jobs:
     container:
       image: ubuntu:latest
       options: --dns 127.0.0.1
+      env:
+        WARPBUILD_RUNNER_VERIFICATION_TOKEN: ${{ env.WARPBUILD_RUNNER_VERIFICATION_TOKEN }}
     services:
       squid-proxy:
         image: ubuntu/squid:latest

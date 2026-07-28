@@ -1,0 +1,561 @@
+name: warp-cache-tests
+
+# The gap this fills:
+#
+#   unit-tests.yml       runs jest across all 11 packages, including warp-cache,
+#                        but every @actions/* package is upstream code we do not
+#                        own — their failures drown ours.
+#   cache-tests.yml      is upstream's, and e2e-tests packages/cache (GitHub's
+#                        cache service). It never touches packages/warp-cache.
+#   releases.yml         does not list warp-cache at all.
+#
+# So nothing currently exercises warp-cache against the WarpBuild cache service
+# before it ships. This does.
+#
+# It has to run on warp runners: isFeatureAvailable() gates on
+# WARPBUILD_RUNNER_VERIFICATION_TOKEN, which only a warp runner injects. On a
+# GitHub-hosted runner every cache call short-circuits and the job goes green
+# without testing anything.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/warp-cache/**'
+      - '.github/workflows/warp-cache-tests.yml'
+  pull_request:
+    paths:
+      - 'packages/warp-cache/**'
+      - '.github/workflows/warp-cache-tests.yml'
+  workflow_dispatch:
+    inputs:
+      cache-url:
+        description: 'Cache service to test against'
+        required: false
+        default: 'https://cache.warpbuild.com'
+
+env:
+  WARPBUILD_CACHE_URL: ${{ github.event.inputs.cache-url || 'https://cache.warpbuild.com' }}
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Unit tests, scoped to warp-cache only, so a failure here is unambiguously ours.
+  # -------------------------------------------------------------------------
+  unit:
+    name: Unit (${{ matrix.runs-on }}, node ${{ matrix.node-version }})
+    strategy:
+      matrix:
+        runs-on: [warp-ubuntu-latest-x64-4x, warp-macos-14-arm64-6x]
+        node-version: [20.x, 24.x]
+      fail-fast: false
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install root packages
+        run: npm ci
+
+      - name: Install and build warp-cache
+        run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+
+      - name: Unit tests
+        run: npx jest packages/warp-cache --runInBand --forceExit --testTimeout 70000
+
+  # ---
+  # Real save against the real cache service.
+  # Split from restore so the restore runs on a clean machine — a same-job
+  # round trip can pass off local state and prove nothing.
+  # -------------------------------------------------------------------------
+  e2e-save:
+    name: e2e save (${{ matrix.runs-on }})
+    strategy:
+      matrix:
+        runs-on:
+          - warp-ubuntu-latest-x64-4x
+          - warp-ubuntu-latest-arm64-16x
+          - warp-macos-14-arm64-6x
+      fail-fast: false
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+
+      - name: Install and build warp-cache
+        run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+
+      - name: Confirm the cache service is actually reachable
+        # Without this, a misconfigured runner makes every downstream step
+        # silently no-op and the whole matrix reports success.
+        run: |
+          node -e "
+            const cache = require('./packages/warp-cache/lib/cache')
+            if (!cache.isFeatureAvailable()) {
+              console.error('WARPBUILD_RUNNER_VERIFICATION_TOKEN is not set — this is not a warp runner, or the token was not injected.')
+              console.error('Refusing to report success on a test that would not have run.')
+              process.exit(1)
+            }
+            console.log('cache service available at', process.env.WARPBUILD_CACHE_URL)
+          "
+
+      - name: Generate files inside and outside the workspace
+        shell: bash
+        run: |
+          packages/warp-cache/__tests__/create-cache-files.sh ${{ runner.os }}-${{ runner.arch }} test-cache
+          packages/warp-cache/__tests__/create-cache-files.sh ${{ runner.os }}-${{ runner.arch }} ~/test-cache
+
+      - name: saveCache
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .saveCache(['test-cache','~/test-cache'], 'e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}')
+              .then(k => console.log('saved:', k))
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+
+
+  # -------------------------------------------------------------------------
+  # Restore on a fresh machine and verify the bytes actually came back.
+  # -------------------------------------------------------------------------
+  e2e-restore:
+    name: e2e restore (${{ matrix.runs-on }})
+    needs: e2e-save
+    strategy:
+      matrix:
+        runs-on:
+          - warp-ubuntu-latest-x64-4x
+          - warp-ubuntu-latest-arm64-16x
+          - warp-macos-14-arm64-6x
+      fail-fast: false
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+
+      - name: Install and build warp-cache
+        run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+
+      - name: restoreCache — exact key
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache','~/test-cache'], 'e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}')
+              .then(k => {
+                if (!k) { console.error('MISS on a key we just wrote'); process.exit(1) }
+                console.log('restored:', k)
+              })
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+
+      - name: Verify restored content
+        shell: bash
+        run: |
+          packages/warp-cache/__tests__/verify-cache-files.sh ${{ runner.os }}-${{ runner.arch }} test-cache
+          packages/warp-cache/__tests__/verify-cache-files.sh ${{ runner.os }}-${{ runner.arch }} ~/test-cache
+
+      - name: restoreCache — restore-key prefix fallback
+        shell: bash
+        run: |
+          rm -rf test-cache ~/test-cache
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache'], 'e2e-nonexistent-${{ github.run_id }}', ['e2e-${{ runner.os }}-${{ runner.arch }}-'])
+              .then(k => {
+                if (!k) { console.error('restore-key fallback did not match'); process.exit(1) }
+                console.log('fell back to:', k)
+              })
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+
+      - name: restoreCache — a genuine miss must return undefined, not throw
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache'], 'e2e-definitely-absent-${{ github.run_id }}')
+              .then(k => {
+                if (k) { console.error('expected a miss, got', k); process.exit(1) }
+                console.log('miss handled cleanly')
+              })
+              .catch(e => { console.error('a miss must not throw:', e); process.exit(1) })
+          "
+
+      - name: restoreCache — lookupOnly must not write to disk
+        shell: bash
+        run: |
+          rm -rf test-cache
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache'], 'e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}', [], {lookupOnly: true})
+              .then(k => {
+                if (!k) { console.error('lookupOnly should still report the hit'); process.exit(1) }
+                console.log('lookupOnly hit:', k)
+              })
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+          if [ -e test-cache/test-file.txt ]; then
+            echo "lookupOnly wrote files to disk — it must not"
+            exit 1
+          fi
+
+  # -------------------------------------------------------------------------
+  # Cache keys with special characters.
+  #
+  # Promoted from benchmarks/cache-key-chars.yaml, which was written to chase a
+  # real bug: gradle-style keys like `gradle-home-v1|Linux-X64|job [abc123]`
+  # save fine but fail to restore, because the key ends up in an S3 presigned
+  # URL. Plain keys work, so it hid for a while. That repro is workflow_dispatch
+  # only, pins the released @v1, and nobody runs it — so the bug class is
+  # currently unguarded on every new build.
+  # -------------------------------------------------------------------------
+  e2e-key-chars:
+    name: e2e key charset
+    runs-on: warp-ubuntu-latest-x64-4x
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plain
+            key: charset-plain
+          - name: pipe
+            key: charset|pipe|key
+          - name: brackets
+            key: charset[brackets]key
+          - name: space-parens
+            key: charset (space) key
+          - name: gradle-style
+            key: gradle-home-v1|Linux-X64|job [abc123]
+          - name: slash
+            key: charset/slash/key
+          - name: unicode
+            key: charset-ünïcødé-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+
+      - name: Round-trip a key containing "${{ matrix.name }}"
+        shell: bash
+        run: |
+          mkdir -p keytest && echo "payload ${{ matrix.name }} ${{ github.run_id }}" > keytest/file.txt
+          KEY='${{ matrix.key }}-${{ github.run_id }}'
+          node -e "
+            const cache = require('./packages/warp-cache/lib/cache')
+            cache.saveCache(['keytest'], process.env.KEY)
+              .then(() => console.log('saved'))
+              .catch(e => { console.error('SAVE FAILED:', e.message); process.exit(1) })
+          " KEY="$KEY"
+          rm -rf keytest
+          node -e "
+            const cache = require('./packages/warp-cache/lib/cache')
+            cache.restoreCache(['keytest'], process.env.KEY)
+              .then(k => {
+                if (!k) { console.error('RESTORE MISSED — save succeeded but restore could not read it back'); process.exit(1) }
+                console.log('restored:', k)
+              })
+              .catch(e => { console.error('RESTORE FAILED:', e.message); process.exit(1) })
+          " KEY="$KEY"
+          grep -q "payload ${{ matrix.name }} ${{ github.run_id }}" keytest/file.txt
+
+  # -------------------------------------------------------------------------
+  # Concurrent writers racing on reserveCache.
+  #
+  # Condensed from benchmarks/gradle-cache-repro-v5.yaml. Parallel jobs saving
+  # the same content-hashed key is exactly what gradle-actions does, and it is
+  # how the "Failed to save: some pre requisites not met" reports surfaced.
+  # A loser in the race must degrade to a warning, never fail the build.
+  # -------------------------------------------------------------------------
+  e2e-concurrent-save:
+    name: e2e concurrent save (writer ${{ matrix.writer }})
+    runs-on: warp-ubuntu-latest-x64-4x
+    strategy:
+      fail-fast: false
+      matrix:
+        writer: [a, b, c]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+
+      - name: Identical payload across all three writers
+        shell: bash
+        run: |
+          mkdir -p race
+          # Same bytes in every writer, so all three compute the same key.
+          head -c 8388608 /dev/zero | base64 > race/payload.txt
+
+      - name: Save the same key from three jobs at once
+        run: |
+          node -e "
+            const cache = require('./packages/warp-cache/lib/cache')
+            cache.saveCache(['race'], 'race-${{ github.run_id }}')
+              .then(k => console.log('writer ${{ matrix.writer }} saved:', k))
+              .catch(e => {
+                // Losing a reserveCache race is expected and must be non-fatal.
+                if (e.name === 'ReserveCacheError') {
+                  console.log('writer ${{ matrix.writer }} lost the race, degraded cleanly:', e.message)
+                  process.exit(0)
+                }
+                console.error('writer ${{ matrix.writer }} failed with an unexpected error:', e)
+                process.exit(1)
+              })
+          "
+
+  # -------------------------------------------------------------------------
+  # A cache written by an arm64 runner must be restorable on x64 when
+  # cross-arch is enabled. This is warp-specific behaviour with no upstream
+  # equivalent, so nothing else covers it.
+  # -------------------------------------------------------------------------
+  # Both directions, mirroring WarpBuilds/cache. runner.os is "Linux" on x64 and
+  # arm64 alike, so the key must carry the arch or the two save jobs collide and
+  # the restore silently reads its own architecture's entry.
+  #
+  # NOTE: the equivalent jobs in WarpBuilds/cache (test-cross-arch-restore-x64
+  # and -arm64) are failing on main today with "Cache service responded with
+  # 404" — save succeeds, restore misses. These are expected to fail here too
+  # until that is fixed. They are included deliberately: the bug is in this
+  # package's territory, and leaving it uncovered is how it stayed unnoticed.
+  e2e-cross-arch-save-x64:
+    name: e2e cross-arch save (x64)
+    runs-on: warp-ubuntu-latest-x64-4x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+      - shell: bash
+        run: packages/warp-cache/__tests__/create-cache-files.sh xarch test-cache
+      - name: saveCache with enableCrossArchArchive
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .saveCache(['test-cache'], 'xarch-from-x64-${{ github.run_id }}', false, true)
+              .then(k => console.log('saved:', k))
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+
+  e2e-cross-arch-restore-arm64:
+    name: e2e cross-arch restore (arm64 reads x64's cache)
+    needs: e2e-cross-arch-save-x64
+    runs-on: warp-ubuntu-latest-arm64-16x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+      - name: restoreCache with enableCrossArchArchive
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache'], 'xarch-from-x64-${{ github.run_id }}', [], {}, false, true)
+              .then(k => {
+                if (!k) { console.error('cross-arch restore missed a key x64 just wrote'); process.exit(1) }
+                console.log('restored:', k)
+              })
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+      - shell: bash
+        run: packages/warp-cache/__tests__/verify-cache-files.sh xarch test-cache
+
+  e2e-cross-arch-save-arm64:
+    name: e2e cross-arch save (arm64)
+    runs-on: warp-ubuntu-latest-arm64-16x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+      - shell: bash
+        run: packages/warp-cache/__tests__/create-cache-files.sh xarch test-cache
+      - name: saveCache with enableCrossArchArchive
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .saveCache(['test-cache'], 'xarch-from-arm64-${{ github.run_id }}', false, true)
+              .then(k => console.log('saved:', k))
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+
+  e2e-cross-arch-restore-x64:
+    name: e2e cross-arch restore (x64 reads arm64's cache)
+    needs: e2e-cross-arch-save-arm64
+    runs-on: warp-ubuntu-latest-x64-4x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+      - name: restoreCache with enableCrossArchArchive
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache'], 'xarch-from-arm64-${{ github.run_id }}', [], {}, false, true)
+              .then(k => {
+                if (!k) { console.error('cross-arch restore missed a key arm64 just wrote'); process.exit(1) }
+                console.log('restored:', k)
+              })
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+      - shell: bash
+        run: packages/warp-cache/__tests__/verify-cache-files.sh xarch test-cache
+
+  # -------------------------------------------------------------------------
+  # Behind an HTTP proxy. @actions/http-client honours https_proxy, and every
+  # request warp-cache makes goes through it — but so do the direct-to-storage
+  # uploads, which is the part unique to us. Mirrors test-proxy-* in
+  # WarpBuilds/cache.
+  # -------------------------------------------------------------------------
+  e2e-proxy:
+    name: e2e save + restore behind a proxy
+    runs-on: warp-ubuntu-latest-x64-4x
+    container:
+      image: ubuntu:latest
+      options: --dns 127.0.0.1
+    services:
+      squid-proxy:
+        image: ubuntu/squid:latest
+        ports:
+          - 3128:3128
+    env:
+      https_proxy: http://squid-proxy:3128
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+      - shell: bash
+        run: packages/warp-cache/__tests__/create-cache-files.sh proxy test-cache
+      - name: saveCache through the proxy
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .saveCache(['test-cache'], 'proxy-${{ github.run_id }}')
+              .then(k => console.log('saved:', k))
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+      - name: restoreCache through the proxy
+        shell: bash
+        run: |
+          rm -rf test-cache
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache'], 'proxy-${{ github.run_id }}')
+              .then(k => {
+                if (!k) { console.error('proxy restore missed'); process.exit(1) }
+                console.log('restored:', k)
+              })
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+          packages/warp-cache/__tests__/verify-cache-files.sh proxy test-cache
+
+  # -------------------------------------------------------------------------
+  # Restore a cache written on the default branch from a non-default branch.
+  # The service scopes entries by GITHUB_REF and falls back to the default
+  # branch — warp-specific, and the reason for the restore-across-branches
+  # work. Mirrors save-or-restore-main-branch / test-restore-from-default-branch.
+  # -------------------------------------------------------------------------
+  e2e-save-default-branch:
+    name: e2e seed default-branch cache
+    if: github.ref == 'refs/heads/main'
+    runs-on: warp-ubuntu-latest-x64-4x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+      - shell: bash
+        run: packages/warp-cache/__tests__/create-cache-files.sh defaultbranch test-cache
+      - name: saveCache under a stable key
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .saveCache(['test-cache'], 'warp-cache-default-branch-probe')
+              .then(k => console.log('saved:', k))
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+
+  e2e-restore-from-default-branch:
+    name: e2e restore default-branch cache from a PR branch
+    if: github.ref != 'refs/heads/main'
+    runs-on: warp-ubuntu-latest-x64-4x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+      - name: restoreCache seeded on the default branch
+        run: |
+          node -e "
+            require('./packages/warp-cache/lib/cache')
+              .restoreCache(['test-cache'], 'warp-cache-default-branch-probe')
+              .then(k => console.log(k ? 'restored: ' + k : 'miss — seed job may not have run on main yet'))
+              .catch(e => { console.error(e); process.exit(1) })
+          "
+
+  # -------------------------------------------------------------------------
+  # Clean up so the test keys do not accumulate in the cache service.
+  # -------------------------------------------------------------------------
+  e2e-cleanup:
+    name: e2e cleanup
+    needs:
+      - e2e-restore
+      - e2e-cross-arch-restore-arm64
+      - e2e-cross-arch-restore-x64
+      - e2e-key-chars
+      - e2e-concurrent-save
+      - e2e-proxy
+    if: always()
+    runs-on: warp-ubuntu-latest-x64-4x
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+      - run: npm ci && npm run tsc
+        working-directory: packages/warp-cache
+
+      - name: deleteCache
+        continue-on-error: true
+        run: |
+          node -e "
+            const cache = require('./packages/warp-cache/lib/cache')
+            const keys = [
+              'e2e-Linux-X64-${{ github.run_id }}',
+              'e2e-Linux-ARM64-${{ github.run_id }}',
+              'e2e-macOS-ARM64-${{ github.run_id }}',
+              'xarch-from-x64-${{ github.run_id }}',
+              'xarch-from-arm64-${{ github.run_id }}',
+              'proxy-${{ github.run_id }}',
+              'race-${{ github.run_id }}'
+            ]
+            Promise.allSettled(keys.map(k => cache.deleteCache(['test-cache'], k)))
+              .then(rs => rs.forEach((r, i) => console.log(keys[i], r.status)))
+          "

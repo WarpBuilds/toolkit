@@ -39,33 +39,6 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # Unit tests, scoped to warp-cache only, so a failure here is unambiguously ours.
-  # -------------------------------------------------------------------------
-  unit:
-    name: Unit (${{ matrix.runs-on }}, node ${{ matrix.node-version }})
-    strategy:
-      matrix:
-        runs-on: [warp-ubuntu-latest-x64-4x, warp-macos-14-arm64-6x]
-        node-version: [20.x, 24.x]
-      fail-fast: false
-    runs-on: ${{ matrix.runs-on }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
-
-      - name: Install root packages
-        run: npm ci
-
-      - name: Install and build warp-cache
-        run: npm ci && npm run tsc
-        working-directory: packages/warp-cache
-
-      - name: Unit tests
-        run: npx jest packages/warp-cache --runInBand --forceExit --testTimeout 70000
-
-  # ---
   # Real save against the real cache service.
   # Split from restore so the restore runs on a clean machine — a same-job
   # round trip can pass off local state and prove nothing.

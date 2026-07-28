@@ -1,9 +1,9 @@
-import * as Context from './context'
-import * as Utils from './internal/utils'
+import * as Context from './context.js'
+import * as Utils from './internal/utils.js'
+import type {OctokitOptions} from '@octokit/core/types'
 
 // octokit + plugins
 import {Octokit} from '@octokit/core'
-import {OctokitOptions} from '@octokit/core/dist-types/types'
 import {restEndpointMethods} from '@octokit/plugin-rest-endpoint-methods'
 import {paginateRest} from '@octokit/plugin-paginate-rest'
 
@@ -23,6 +23,8 @@ export const GitHub = Octokit.plugin(
   paginateRest
 ).defaults(defaults)
 
+export {getUserAgentWithOrchestrationId} from './internal/utils.js'
+
 /**
  * Convience function to correctly format Octokit Options to pass into the constructor.
  *
@@ -39,6 +41,14 @@ export function getOctokitOptions(
   const auth = Utils.getAuthString(token, opts)
   if (auth) {
     opts.auth = auth
+  }
+
+  // Orchestration ID
+  const userAgent = Utils.getUserAgentWithOrchestrationId(
+    opts.userAgent as string | undefined
+  )
+  if (userAgent) {
+    opts.userAgent = userAgent
   }
 
   return opts

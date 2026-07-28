@@ -7,11 +7,12 @@ import * as config from '../src/internal/config'
 import {CacheFilename, CompressionMethod} from '../src/internal/constants'
 import * as tar from '../src/internal/tar'
 import {TypedResponse} from '@actions/http-client/lib/interfaces'
+import {HttpClientError} from '@actions/http-client'
 import {
   ReserveCacheResponse,
   ITypedResponseWithError
 } from '../src/internal/contracts'
-import {HttpClientError} from '@actions/http-client'
+import {CacheServiceClientJSON} from '../src/generated/results/api/v1/cache.twirp-client'
 
 jest.mock('../src/internal/cacheHttpClient')
 jest.mock('../src/internal/cacheUtils')
@@ -34,6 +35,18 @@ beforeAll(() => {
   jest.spyOn(cacheUtils, 'createTempDirectory').mockImplementation(async () => {
     return Promise.resolve('/foo/bar')
   })
+  // config is auto-mocked; use the real cache-mode helpers so gating reflects
+  // ACTIONS_CACHE_MODE and unset stays permissive.
+  const actualConfig = jest.requireActual('../src/internal/config')
+  jest
+    .spyOn(config, 'getCacheMode')
+    .mockImplementation(actualConfig.getCacheMode)
+  jest
+    .spyOn(config, 'isCacheReadable')
+    .mockImplementation(actualConfig.isCacheReadable)
+  jest
+    .spyOn(config, 'isCacheWritable')
+    .mockImplementation(actualConfig.isCacheWritable)
 })
 
 test('save with missing input should fail', async () => {
@@ -41,6 +54,75 @@ test('save with missing input should fail', async () => {
   const primaryKey = 'Linux-node-bb828da54c148048dd17899ba9fda624811cfb43'
   await expect(saveCache(paths, primaryKey)).rejects.toThrowError(
     `Path Validation Error: At least one directory or file path is required`
+  )
+})
+
+describe('save cache-mode gating', () => {
+  const originalMode = process.env.ACTIONS_CACHE_MODE
+  const originalV2 = process.env.ACTIONS_CACHE_SERVICE_V2
+
+  const restoreEnv = (key: string, value: string | undefined): void => {
+    if (value === undefined) {
+      delete process.env[key]
+    } else {
+      process.env[key] = value
+    }
+  }
+
+  afterEach(() => {
+    restoreEnv('ACTIONS_CACHE_MODE', originalMode)
+    restoreEnv('ACTIONS_CACHE_SERVICE_V2', originalV2)
+  })
+
+  // The skip short-circuits before v1/v2 dispatch, so it applies regardless of
+  // the ACTIONS_CACHE_SERVICE_V2 feature flag.
+  test.each([
+    ['read', undefined],
+    ['read', 'true'],
+    ['none', undefined],
+    ['none', 'true']
+  ])(
+    "mode '%s' skips save with ACTIONS_CACHE_SERVICE_V2=%s",
+    async (mode, v2) => {
+      process.env.ACTIONS_CACHE_MODE = mode
+      restoreEnv('ACTIONS_CACHE_SERVICE_V2', v2)
+      const logInfoMock = jest.spyOn(core, 'info')
+      const resolvePathsMock = jest.spyOn(cacheUtils, 'resolvePaths')
+
+      const cacheId = await saveCache(['node_modules'], 'node-test')
+
+      expect(cacheId).toBe(-1)
+      expect(resolvePathsMock).not.toHaveBeenCalled()
+      expect(logInfoMock).toHaveBeenCalledTimes(1)
+      expect(logInfoMock).toHaveBeenCalledWith(
+        `Cache save skipped: the effective cache-mode '${mode}' does not permit writes.`
+      )
+    }
+  )
+
+  test.each(['write', 'write-only', '', 'garbage'])(
+    "mode '%s' does not skip save",
+    async mode => {
+      if (mode === '') {
+        delete process.env.ACTIONS_CACHE_MODE
+      } else {
+        process.env.ACTIONS_CACHE_MODE = mode
+      }
+      const logInfoMock = jest.spyOn(core, 'info')
+      const resolvePathsMock = jest.spyOn(cacheUtils, 'resolvePaths')
+
+      try {
+        await saveCache(['node_modules'], 'node-test')
+      } catch {
+        // Downstream client is not fully mocked here; we only assert the guard
+        // let execution proceed past it.
+      }
+
+      expect(resolvePathsMock).toHaveBeenCalled()
+      expect(logInfoMock).not.toHaveBeenCalledWith(
+        expect.stringContaining('Cache save skipped')
+      )
+    }
   )
 })
 
@@ -220,49 +302,109 @@ test('save with reserve cache failure should fail', async () => {
   expect(getCompressionMock).toHaveBeenCalledTimes(1)
 })
 
-test('save with server error should fail', async () => {
-  const filePath = 'node_modules'
+test('save with reserve cache denied by read-only token logs warning (not info)', async () => {
+  // V1 path: when the legacy ReserveCache REST call returns an error message
+  // starting with the stable `cache write denied:` prefix, the toolkit must
+  // surface it as a `core.warning` (not the usual `core.info` used for the
+  // generic "another job may be creating this cache" contention case).
+  const paths = ['node_modules']
   const primaryKey = 'Linux-node-bb828da54c148048dd17899ba9fda624811cfb43'
-  const cachePaths = [path.resolve(filePath)]
+  const deniedMessage =
+    'cache write denied: read-only token issued for untrusted trigger'
+  const logInfoMock = jest.spyOn(core, 'info')
   const logWarningMock = jest.spyOn(core, 'warning')
-  const cacheId = 4
+
   const reserveCacheMock = jest
     .spyOn(cacheHttpClient, 'reserveCache')
     .mockImplementation(async () => {
-      const response: TypedResponse<ReserveCacheResponse> = {
-        statusCode: 500,
-        result: {cacheId},
-        headers: {}
+      const response: ITypedResponseWithError<ReserveCacheResponse> = {
+        statusCode: 403,
+        result: null,
+        headers: {},
+        error: new HttpClientError(deniedMessage, 403)
       }
       return response
     })
 
   const createTarMock = jest.spyOn(tar, 'createTar')
+  const saveCacheMock = jest.spyOn(cacheHttpClient, 'saveCache')
+  const compression = CompressionMethod.Zstd
+  const getCompressionMock = jest
+    .spyOn(cacheUtils, 'getCompressionMethod')
+    .mockReturnValueOnce(Promise.resolve(compression))
 
+  const cacheId = await saveCache(paths, primaryKey)
+  expect(cacheId).toBe(-1)
+
+  // The generic "another job may be creating this cache" info log MUST NOT
+  // fire — this is a policy denial, not a contention case.
+  expect(logInfoMock).not.toHaveBeenCalledWith(
+    expect.stringContaining('another job may be creating this cache')
+  )
+  // A single warning carrying the stable prefix is what the customer sees.
+  expect(logWarningMock).toHaveBeenCalledWith(
+    `Failed to save: Unable to reserve cache with key ${primaryKey}. More details: ${deniedMessage}`
+  )
+
+  expect(logWarningMock).toHaveBeenCalledTimes(1)
+  expect(reserveCacheMock).toHaveBeenCalledTimes(1)
+  expect(createTarMock).toHaveBeenCalledTimes(1)
+  expect(saveCacheMock).toHaveBeenCalledTimes(0)
+  expect(getCompressionMock).toHaveBeenCalledTimes(1)
+})
+
+test('save with server error should fail', async () => {
+  const filePath = 'node_modules'
+  const primaryKey = 'Linux-node-bb828da54c148048dd17899ba9fda624811cfb43'
+  const logErrorMock = jest.spyOn(core, 'error')
+
+  // Mock cache service version to V2
+  const getCacheServiceVersionMock = jest
+    .spyOn(config, 'getCacheServiceVersion')
+    .mockReturnValue('v2')
+
+  // Mock V2 CreateCacheEntry to succeed
+  const createCacheEntryMock = jest
+    .spyOn(CacheServiceClientJSON.prototype, 'CreateCacheEntry')
+    .mockReturnValue(
+      Promise.resolve({
+        ok: true,
+        signedUploadUrl: 'https://blob-storage.local?signed=true',
+        message: ''
+      })
+    )
+
+  // Mock the FinalizeCacheEntryUpload to succeed (since the error should happen in saveCache)
+  jest
+    .spyOn(CacheServiceClientJSON.prototype, 'FinalizeCacheEntryUpload')
+    .mockReturnValue(
+      Promise.resolve({ok: true, entryId: '4', message: 'Success'})
+    )
+
+  const createTarMock = jest.spyOn(tar, 'createTar')
+
+  // Mock the saveCache call to throw a server error
   const saveCacheMock = jest
     .spyOn(cacheHttpClient, 'saveCache')
     .mockImplementationOnce(() => {
-      throw new Error('HTTP Error Occurred')
+      throw new HttpClientError('HTTP Error Occurred', 500)
     })
+
   const compression = CompressionMethod.Zstd
   const getCompressionMock = jest
     .spyOn(cacheUtils, 'getCompressionMethod')
     .mockReturnValueOnce(Promise.resolve(compression))
 
   await saveCache([filePath], primaryKey)
-  expect(logWarningMock).toHaveBeenCalledTimes(1)
-  expect(logWarningMock).toHaveBeenCalledWith(
+
+  expect(logErrorMock).toHaveBeenCalledTimes(1)
+  expect(logErrorMock).toHaveBeenCalledWith(
     'Failed to save: HTTP Error Occurred'
   )
 
-  expect(reserveCacheMock).toHaveBeenCalledTimes(1)
-  expect(reserveCacheMock).toHaveBeenCalledWith(primaryKey, [filePath], {
-    cacheSize: undefined,
-    compressionMethod: compression,
-    enableCrossOsArchive: false
-  })
+  expect(createCacheEntryMock).toHaveBeenCalledTimes(1)
   const archiveFolder = '/foo/bar'
-  const archiveFile = path.join(archiveFolder, CacheFilename.Zstd)
+  const cachePaths = [path.resolve(filePath)]
   expect(createTarMock).toHaveBeenCalledTimes(1)
   expect(createTarMock).toHaveBeenCalledWith(
     archiveFolder,
@@ -270,13 +412,10 @@ test('save with server error should fail', async () => {
     compression
   )
   expect(saveCacheMock).toHaveBeenCalledTimes(1)
-  expect(saveCacheMock).toHaveBeenCalledWith(
-    cacheId,
-    archiveFile,
-    '',
-    undefined
-  )
   expect(getCompressionMock).toHaveBeenCalledTimes(1)
+
+  // Restore the getCacheServiceVersion mock to its original state
+  getCacheServiceVersionMock.mockRestore()
 })
 
 test('save with valid inputs uploads a cache', async () => {

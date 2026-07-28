@@ -1,10 +1,14 @@
-import * as config from '../src/internal/shared/config'
+import * as config from '../src/internal/shared/config.js'
 import os from 'os'
 
-// Mock the 'os' module
-jest.mock('os', () => ({
-  cpus: jest.fn()
-}))
+// Mock the `cpus()` function in the `os` module
+jest.mock('os', () => {
+  const osActual = jest.requireActual('os')
+  return {
+    ...osActual,
+    cpus: jest.fn()
+  }
+})
 
 beforeEach(() => {
   jest.resetModules()
@@ -99,5 +103,47 @@ describe('uploadConcurrencyEnv', () => {
     expect(() => {
       config.getConcurrency()
     }).toThrow()
+  })
+})
+
+describe('getMaxArtifactListCount', () => {
+  beforeEach(() => {
+    delete process.env.ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT
+  })
+
+  it('should return default 1000 when no env set', () => {
+    expect(config.getMaxArtifactListCount()).toBe(1000)
+  })
+
+  it('should return value set in ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT', () => {
+    process.env.ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT = '2000'
+    expect(config.getMaxArtifactListCount()).toBe(2000)
+  })
+
+  it('should throw if value set in ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT is invalid', () => {
+    process.env.ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT = 'abc'
+    expect(() => {
+      config.getMaxArtifactListCount()
+    }).toThrow(
+      'Invalid value set for ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT env variable'
+    )
+  })
+
+  it('should throw if ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT is < 1', () => {
+    process.env.ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT = '0'
+    expect(() => {
+      config.getMaxArtifactListCount()
+    }).toThrow(
+      'Invalid value set for ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT env variable'
+    )
+  })
+
+  it('should throw if ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT is negative', () => {
+    process.env.ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT = '-100'
+    expect(() => {
+      config.getMaxArtifactListCount()
+    }).toThrow(
+      'Invalid value set for ACTIONS_ARTIFACT_MAX_ARTIFACT_COUNT env variable'
+    )
   })
 })

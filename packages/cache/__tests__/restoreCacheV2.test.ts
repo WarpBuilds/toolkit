@@ -8,6 +8,7 @@ import {restoreCache} from '../src/cache'
 import {CacheFilename, CompressionMethod} from '../src/internal/constants'
 import {CacheServiceClientJSON} from '../src/generated/results/api/v1/cache.twirp-client'
 import {DownloadOptions} from '../src/options'
+import {HttpClientError} from '@actions/http-client'
 
 jest.mock('../src/internal/cacheHttpClient')
 jest.mock('../src/internal/cacheUtils')
@@ -31,6 +32,19 @@ beforeAll(() => {
 
   // Ensure that we're using v2 for these tests
   jest.spyOn(config, 'getCacheServiceVersion').mockReturnValue('v2')
+
+  // config is auto-mocked; use the real cache-mode helpers so gating reflects
+  // ACTIONS_CACHE_MODE and unset stays permissive.
+  const actualConfig = jest.requireActual('../src/internal/config')
+  jest
+    .spyOn(config, 'getCacheMode')
+    .mockImplementation(actualConfig.getCacheMode)
+  jest
+    .spyOn(config, 'isCacheReadable')
+    .mockImplementation(actualConfig.isCacheReadable)
+  jest
+    .spyOn(config, 'isCacheWritable')
+    .mockImplementation(actualConfig.isCacheWritable)
 
   logDebugMock = jest.spyOn(core, 'debug')
   logInfoMock = jest.spyOn(core, 'info')
@@ -95,20 +109,47 @@ test('restore with no cache found', async () => {
 test('restore with server error should fail', async () => {
   const paths = ['node_modules']
   const key = 'node-test'
-  const logWarningMock = jest.spyOn(core, 'warning')
+  const logErrorMock = jest.spyOn(core, 'error')
 
   jest
     .spyOn(CacheServiceClientJSON.prototype, 'GetCacheEntryDownloadURL')
     .mockImplementation(() => {
-      throw new Error('HTTP Error Occurred')
+      throw new HttpClientError('HTTP Error Occurred', 500)
     })
 
   const cacheKey = await restoreCache(paths, key)
   expect(cacheKey).toBe(undefined)
-  expect(logWarningMock).toHaveBeenCalledTimes(1)
-  expect(logWarningMock).toHaveBeenCalledWith(
+  expect(logErrorMock).toHaveBeenCalledTimes(1)
+  expect(logErrorMock).toHaveBeenCalledWith(
     'Failed to restore: HTTP Error Occurred'
   )
+})
+
+test('restore denied by read-only token logs warning and reports cache miss', async () => {
+  // The receiver returns twirp PermissionDenied (403) when the run's token has
+  // no readable cache scopes; the client wraps it so the `cache read denied:`
+  // prefix arrives embedded. Expect a single warning (not error) and a miss.
+  const paths = ['node_modules']
+  const key = 'node-test'
+  const logErrorMock = jest.spyOn(core, 'error')
+  const logWarningMock = jest.spyOn(core, 'warning')
+  const wrappedDeniedMessage =
+    'Failed to GetCacheEntryDownloadURL: Received non-retryable error: ' +
+    'Failed request: (403) Forbidden: cache read denied: token has no readable scopes'
+
+  jest
+    .spyOn(CacheServiceClientJSON.prototype, 'GetCacheEntryDownloadURL')
+    .mockImplementation(() => {
+      throw new Error(wrappedDeniedMessage)
+    })
+
+  const cacheKey = await restoreCache(paths, key)
+  expect(cacheKey).toBe(undefined)
+  expect(logErrorMock).not.toHaveBeenCalled()
+  expect(logWarningMock).toHaveBeenCalledWith(
+    `Failed to restore: ${wrappedDeniedMessage}`
+  )
+  expect(logWarningMock).toHaveBeenCalledTimes(1)
 })
 
 test('restore with restore keys and no cache found', async () => {
@@ -265,6 +306,7 @@ test('restore with zstd compressed cache found', async () => {
   const cacheKey = await restoreCache(paths, key, [], options)
 
   expect(cacheKey).toBe(key)
+  expect(logInfoMock).toHaveBeenCalledWith(`Cache hit for: ${key}`)
   expect(getCacheVersionMock).toHaveBeenCalledWith(
     paths,
     compressionMethod,
@@ -342,6 +384,9 @@ test('restore with cache found for restore key', async () => {
   const cacheKey = await restoreCache(paths, key, restoreKeys, options)
 
   expect(cacheKey).toBe(restoreKeys[0])
+  expect(logInfoMock).toHaveBeenCalledWith(
+    `Cache hit for restore-key: ${restoreKeys[0]}`
+  )
   expect(getCacheVersionMock).toHaveBeenCalledWith(
     paths,
     compressionMethod,

@@ -1,18 +1,27 @@
 import * as core from '@actions/core'
 import * as path from 'path'
-import * as utils from './internal/cacheUtils'
-import * as cacheHttpClient from './internal/cacheHttpClient'
-import * as cacheTwirpClient from './internal/shared/cacheTwirpClient'
-import {getCacheServiceVersion, isGhes} from './internal/config'
-import {DownloadOptions, UploadOptions} from './options'
-import {createTar, extractTar, listTar} from './internal/tar'
+import * as utils from './internal/cacheUtils.js'
+import * as cacheHttpClient from './internal/cacheHttpClient.js'
+import * as cacheTwirpClient from './internal/shared/cacheTwirpClient.js'
+import {
+  getCacheServiceVersion,
+  isGhes,
+  getCacheMode,
+  isCacheReadable,
+  isCacheWritable
+} from './internal/config.js'
+import {DownloadOptions, UploadOptions} from './options.js'
+import {createTar, extractTar, listTar} from './internal/tar.js'
 import {
   CreateCacheEntryRequest,
   FinalizeCacheEntryUploadRequest,
   FinalizeCacheEntryUploadResponse,
   GetCacheEntryDownloadURLRequest
-} from './generated/results/api/v1/cache'
-import {CacheFileSizeLimit} from './internal/constants'
+} from './generated/results/api/v1/cache.js'
+import {HttpClientError} from '@actions/http-client'
+import {CacheReadDeniedMessagePrefix} from './internal/constants.js'
+
+export type {DownloadOptions, UploadOptions}
 export class ValidationError extends Error {
   constructor(message: string) {
     super(message)
@@ -26,6 +35,61 @@ export class ReserveCacheError extends Error {
     super(message)
     this.name = 'ReserveCacheError'
     Object.setPrototypeOf(this, ReserveCacheError.prototype)
+  }
+}
+
+/**
+ * Stable prefix the cache service writes into the cache reservation response
+ * when the issuer downgraded the cache token to read-only (for example, because
+ * the run was triggered by an untrusted event). saveCacheV1 / saveCacheV2
+ * dispatch on this prefix to re-classify the failure as a CacheWriteDeniedError
+ * so consumers and tests can distinguish a policy denial from other reservation
+ * failures. Internally it is logged as a non-fatal warning like other
+ * best-effort save failures.
+ */
+export const CACHE_WRITE_DENIED_PREFIX = 'cache write denied:'
+
+/**
+ * Raised when the cache backend refuses to reserve a writable cache entry
+ * because the JWT issued for this run was scoped read-only (for example, the
+ * run was triggered by an event the repository administrator classified as
+ * untrusted). The service-supplied detail message always begins with
+ * `cache write denied:` (the full error message includes additional context
+ * like the cache key).
+ *
+ * Extends ReserveCacheError for source-compatibility: existing
+ * `instanceof ReserveCacheError` checks and `typedError.name ===
+ * ReserveCacheError.name` paths keep working, while consumers that want to
+ * distinguish the policy case can match on this subclass.
+ */
+export class CacheWriteDeniedError extends ReserveCacheError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CacheWriteDeniedError'
+    Object.setPrototypeOf(this, CacheWriteDeniedError.prototype)
+  }
+}
+
+// Re-exported from constants so consumers keep referencing it here; the shared
+// value also drives detection in cacheHttpClient without duplicating the string.
+export const CACHE_READ_DENIED_PREFIX = CacheReadDeniedMessagePrefix
+
+// Raised when the cache backend denies a download URL because the run's token
+// has no readable cache scopes. Caching is best-effort, so restoreCache logs a
+// warning and reports a cache miss rather than rethrowing this.
+export class CacheReadDeniedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CacheReadDeniedError'
+    Object.setPrototypeOf(this, CacheReadDeniedError.prototype)
+  }
+}
+
+export class FinalizeCacheError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'FinalizeCacheError'
+    Object.setPrototypeOf(this, FinalizeCacheError.prototype)
   }
 }
 
@@ -57,7 +121,18 @@ function checkKey(key: string): void {
  * @returns boolean return true if Actions cache service feature is available, otherwise false
  */
 export function isFeatureAvailable(): boolean {
-  return !!process.env['ACTIONS_CACHE_URL']
+  const cacheServiceVersion = getCacheServiceVersion()
+
+  // Check availability based on cache service version
+  switch (cacheServiceVersion) {
+    case 'v2':
+      // For v2, we need ACTIONS_RESULTS_URL
+      return !!process.env['ACTIONS_RESULTS_URL']
+    case 'v1':
+    default:
+      // For v1, we only need ACTIONS_CACHE_URL
+      return !!process.env['ACTIONS_CACHE_URL']
+  }
 }
 
 /**
@@ -81,6 +156,17 @@ export async function restoreCache(
   core.debug(`Cache service version: ${cacheServiceVersion}`)
 
   checkPaths(paths)
+
+  const cacheMode = getCacheMode()
+  if (!isCacheReadable(cacheMode)) {
+    core.info(
+      `Cache restore skipped: the effective cache-mode '${cacheMode}' does not permit reads.`
+    )
+    core.debug(
+      `Skipped restore for paths [${paths.join(', ')}] with primary key '${primaryKey}'.`
+    )
+    return undefined
+  }
 
   switch (cacheServiceVersion) {
     case 'v2':
@@ -139,10 +225,25 @@ async function restoreCacheV1(
   let archivePath = ''
   try {
     // path are needed to compute version
-    const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
-      compressionMethod,
-      enableCrossOsArchive
-    })
+    let cacheEntry
+    try {
+      cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
+        compressionMethod,
+        enableCrossOsArchive
+      })
+    } catch (error) {
+      // The v1 artifact cache service returns HTTP 403 with a
+      // `cache read denied:` body when the run's token has no readable cache
+      // scopes. getCacheEntry lives in a dependency-free internal module and
+      // cannot import CacheReadDeniedError without a circular dependency, so it
+      // only surfaces the raw denial message; we classify it into the typed
+      // error here so the outer catch and consumers can dispatch on it.
+      const errorMessage = (error as Error)?.message ?? ''
+      if (errorMessage.includes(CACHE_READ_DENIED_PREFIX)) {
+        throw new CacheReadDeniedError(errorMessage)
+      }
+      throw error
+    }
     if (!cacheEntry?.archiveLocation) {
       // Cache not found
       return undefined
@@ -186,8 +287,19 @@ async function restoreCacheV1(
     if (typedError.name === ValidationError.name) {
       throw error
     } else {
-      // Supress all non-validation cache related errors because caching should be optional
-      core.warning(`Failed to restore: ${(error as Error).message}`)
+      // warn on cache restore failure and continue build
+      // Log server errors (5xx) as errors, all other errors as warnings.
+      // A read denied by policy (CacheReadDeniedError) is not an HttpClientError
+      // so it falls here and is warned, treated as a cache miss.
+      if (
+        typedError instanceof HttpClientError &&
+        typeof typedError.statusCode === 'number' &&
+        typedError.statusCode >= 500
+      ) {
+        core.error(`Failed to restore: ${(error as Error).message}`)
+      } else {
+        core.warning(`Failed to restore: ${(error as Error).message}`)
+      }
     }
   } finally {
     // Try to delete the archive to save space
@@ -253,7 +365,19 @@ async function restoreCacheV2(
       )
     }
 
-    const response = await twirpClient.GetCacheEntryDownloadURL(request)
+    let response
+    try {
+      response = await twirpClient.GetCacheEntryDownloadURL(request)
+    } catch (error) {
+      // The receiver returns twirp PermissionDenied (403) when the run's token
+      // has no readable cache scopes. The client wraps that 403, so the stable
+      // prefix is embedded in the message rather than leading it.
+      const errorMessage = (error as Error)?.message ?? ''
+      if (errorMessage.includes(CACHE_READ_DENIED_PREFIX)) {
+        throw new CacheReadDeniedError(errorMessage)
+      }
+      throw error
+    }
 
     if (!response.ok) {
       core.debug(
@@ -264,7 +388,12 @@ async function restoreCacheV2(
       return undefined
     }
 
-    core.info(`Cache hit for: ${request.key}`)
+    const isRestoreKeyMatch = request.key !== response.matchedKey
+    if (isRestoreKeyMatch) {
+      core.info(`Cache hit for restore-key: ${response.matchedKey}`)
+    } else {
+      core.info(`Cache hit for: ${response.matchedKey}`)
+    }
 
     if (options?.lookupOnly) {
       core.info('Lookup only - skipping download')
@@ -304,8 +433,19 @@ async function restoreCacheV2(
     if (typedError.name === ValidationError.name) {
       throw error
     } else {
-      // Supress all non-validation cache related errors because caching should be optional
-      core.warning(`Failed to restore: ${(error as Error).message}`)
+      // Suppress all non-validation cache related errors because caching should be optional
+      // Log server errors (5xx) as errors, all other errors as warnings.
+      // A read denied by policy (CacheReadDeniedError) is not an HttpClientError
+      // so it falls here and is warned, treated as a cache miss.
+      if (
+        typedError instanceof HttpClientError &&
+        typeof typedError.statusCode === 'number' &&
+        typedError.statusCode >= 500
+      ) {
+        core.error(`Failed to restore: ${(error as Error).message}`)
+      } else {
+        core.warning(`Failed to restore: ${(error as Error).message}`)
+      }
     }
   } finally {
     try {
@@ -339,6 +479,18 @@ export async function saveCache(
   core.debug(`Cache service version: ${cacheServiceVersion}`)
   checkPaths(paths)
   checkKey(key)
+
+  const cacheMode = getCacheMode()
+  if (!isCacheWritable(cacheMode)) {
+    core.info(
+      `Cache save skipped: the effective cache-mode '${cacheMode}' does not permit writes.`
+    )
+    core.debug(
+      `Skipped save for paths [${paths.join(', ')}] with key '${key}'.`
+    )
+    return -1
+  }
+
   switch (cacheServiceVersion) {
     case 'v2':
       return await saveCacheV2(paths, key, options, enableCrossOsArchive)
@@ -423,6 +575,18 @@ async function saveCacheV1(
           )} MB (${archiveFileSize} B) is over the data cap limit, not saving cache.`
       )
     } else {
+      // Inspect the receiver's error message before deciding which error to
+      // throw. A message starting with the stable `cache write denied:`
+      // prefix indicates the issuer downgraded the token to read-only
+      // (policy denial), not a contention case, so we surface it as a
+      // CacheWriteDeniedError which the outer catch arm logs at warning
+      // level.
+      const detailMessage = reserveCacheResponse?.error?.message
+      if (detailMessage?.startsWith(CACHE_WRITE_DENIED_PREFIX)) {
+        throw new CacheWriteDeniedError(
+          `Unable to reserve cache with key ${key}. More details: ${detailMessage}`
+        )
+      }
       throw new ReserveCacheError(
         `Unable to reserve cache with key ${key}, another job may be creating this cache. More details: ${reserveCacheResponse?.error?.message}`
       )
@@ -437,7 +601,19 @@ async function saveCacheV1(
     } else if (typedError.name === ReserveCacheError.name) {
       core.info(`Failed to save: ${typedError.message}`)
     } else {
-      core.warning(`Failed to save: ${typedError.message}`)
+      // Log server errors (5xx) as errors, all other errors as warnings.
+      // A write denied by policy (CacheWriteDeniedError) is not an
+      // HttpClientError and its name does not match the ReserveCacheError arm,
+      // so it falls here and is warned without failing the run.
+      if (
+        typedError instanceof HttpClientError &&
+        typeof typedError.statusCode === 'number' &&
+        typedError.statusCode >= 500
+      ) {
+        core.error(`Failed to save: ${typedError.message}`)
+      } else {
+        core.warning(`Failed to save: ${typedError.message}`)
+      }
     }
   } finally {
     // Try to delete the archive to save space
@@ -506,15 +682,6 @@ async function saveCacheV2(
     const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath)
     core.debug(`File Size: ${archiveFileSize}`)
 
-    // For GHES, this check will take place in ReserveCache API with enterprise file size limit
-    if (archiveFileSize > CacheFileSizeLimit && !isGhes()) {
-      throw new Error(
-        `Cache size of ~${Math.round(
-          archiveFileSize / (1024 * 1024)
-        )} MB (${archiveFileSize} B) is over the 10GB limit, not saving cache.`
-      )
-    }
-
     // Set the archive size in the options, will be used to display the upload progress
     options.archiveSizeBytes = archiveFileSize
 
@@ -534,11 +701,26 @@ async function saveCacheV2(
     try {
       const response = await twirpClient.CreateCacheEntry(request)
       if (!response.ok) {
-        throw new Error('Response was not ok')
+        // Skip the redundant inner warning when the receiver signalled a
+        // policy denial: the outer catch arm below will log a single
+        // customer-facing warning.
+        if (
+          response.message &&
+          !response.message.startsWith(CACHE_WRITE_DENIED_PREFIX)
+        ) {
+          core.warning(`Cache reservation failed: ${response.message}`)
+        }
+        throw new Error(response.message || 'Response was not ok')
       }
       signedUploadUrl = response.signedUploadUrl
     } catch (error) {
       core.debug(`Failed to reserve cache: ${error}`)
+      const errorMessage = (error as Error)?.message ?? ''
+      if (errorMessage.startsWith(CACHE_WRITE_DENIED_PREFIX)) {
+        throw new CacheWriteDeniedError(
+          `Unable to reserve cache with key ${key}. More details: ${errorMessage}`
+        )
+      }
       throw new ReserveCacheError(
         `Unable to reserve cache with key ${key}, another job may be creating this cache.`
       )
@@ -563,6 +745,9 @@ async function saveCacheV2(
     core.debug(`FinalizeCacheEntryUploadResponse: ${finalizeResponse.ok}`)
 
     if (!finalizeResponse.ok) {
+      if (finalizeResponse.message) {
+        throw new FinalizeCacheError(finalizeResponse.message)
+      }
       throw new Error(
         `Unable to finalize cache with key ${key}, another job may be finalizing this cache.`
       )
@@ -575,8 +760,22 @@ async function saveCacheV2(
       throw error
     } else if (typedError.name === ReserveCacheError.name) {
       core.info(`Failed to save: ${typedError.message}`)
+    } else if (typedError.name === FinalizeCacheError.name) {
+      core.warning(typedError.message)
     } else {
-      core.warning(`Failed to save: ${typedError.message}`)
+      // Log server errors (5xx) as errors, all other errors as warnings.
+      // A write denied by policy (CacheWriteDeniedError) is not an
+      // HttpClientError and its name does not match the ReserveCacheError arm,
+      // so it falls here and is warned without failing the run.
+      if (
+        typedError instanceof HttpClientError &&
+        typeof typedError.statusCode === 'number' &&
+        typedError.statusCode >= 500
+      ) {
+        core.error(`Failed to save: ${typedError.message}`)
+      } else {
+        core.warning(`Failed to save: ${typedError.message}`)
+      }
     }
   } finally {
     // Try to delete the archive to save space

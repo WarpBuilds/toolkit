@@ -1,7 +1,7 @@
-import {Globber, DefaultGlobber} from './internal-globber'
-import {GlobOptions} from './internal-glob-options'
-import {HashFileOptions} from './internal-hash-file-options'
-import {hashFiles as _hashFiles} from './internal-hash-files'
+import {Globber, DefaultGlobber} from './internal-globber.js'
+import {GlobOptions} from './internal-glob-options.js'
+import {HashFileOptions} from './internal-hash-file-options.js'
+import {hashFiles as _hashFiles} from './internal-hash-files.js'
 
 export {Globber, GlobOptions}
 
@@ -37,5 +37,5 @@ export async function hashFiles(
     followSymbolicLinks = options.followSymbolicLinks
   }
   const globber = await create(patterns, {followSymbolicLinks})
-  return _hashFiles(globber, currentWorkspace, verbose)
+  return _hashFiles(globber, currentWorkspace, options, verbose)
 }
